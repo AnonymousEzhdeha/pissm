@@ -1,6 +1,6 @@
 # Structured Temporal Inference in Hybrid State-Space Models
 This is a, commented version of the Code used for the experiments described in the paper.
-Submission for ICLR 2026
+
 
 ## Framework
 
