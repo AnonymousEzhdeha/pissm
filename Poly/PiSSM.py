@@ -83,7 +83,8 @@ class PiSSM(k.models.Model):
                                             Fgru_Units =Fgru_Units,
                                             KG_InputSize = KG_InputSize,
                                             Xgru_InputSize = Xgru_InputSize,
-                                            Fgru_InputSize = Fgru_InputSize)
+                                            Fgru_InputSize = Fgru_InputSize,
+                                            cell_type="lstm")
         elif self.cell_type.lower() == "lstm":
             print("Running LSTM Baseline")
             self._cell = k.layers.LSTMCell(2 * self._lsd)
@@ -228,7 +229,6 @@ class PiSSM(k.models.Model):
         element_wise_nll = 0.5 * (np.log(2 * np.pi) + tf.math.log(pred_var) + ((target - pred_mean)**2) / pred_var)
         sample_wise_error = tf.reduce_sum(element_wise_nll, axis=-1) # [batch, T]
         base_loss = tf.reduce_mean(tf.reduce_mean(sample_wise_error, axis=1)) #scalar 
-        # base_loss = tf.reduce_mean(tf.reduce_sum(sample_wise_error, axis=1)) #scalar 
         # base_loss = tf.reduce_mean(sample_wise_error) #scalar 
         return base_loss
 
@@ -288,6 +288,135 @@ class PiSSM(k.models.Model):
         sample_wise_error = tf.reduce_sum(point_wise_error, axis=red_axis)
         return tf.reduce_mean(sample_wise_error)
     
+    def enforce_iss_condition(self, cell_type="gru"):
+        """
+        Enforce ISS stability constraints on recurrent cell parameters.
+        Supports GRU (for now).
+        """
+        if cell_type == "gru":
+            # Grab the GRUCell (for KG, Q, or main transition cell)
+            gru_cell = self._cell.KGCELL   # or QCELL depending on context
+
+            # GRU weights:
+            # - kernel: [input_dim, 3*units]
+            # - recurrent_kernel: [units, 3*units]
+            # - bias: [2, 3*units] in TF2 (input + recurrent bias)
+            W = None
+            U = None
+            b = None
+            for w in gru_cell.weights:
+                if "recurrent_kernel" in w.name:
+                    # U = w  # shape [units, 4*units]
+                    U = next(w for w in gru_cell.trainable_weights if "recurrent_kernel" in w.name)
+                if "kernel" in w.name:
+                    W = w  # shape [input_dim, 4*units]
+                if "bias" in w.name:
+                    b = w
+
+            if W is None or U is None or b is None:
+                return
+
+            units = gru_cell.units
+
+            # Slice into gates: update (z), reset (r), candidate (h)
+            W_z, W_r, W_h = tf.split(W, 3, axis=1)
+            U_z, U_r, U_h = tf.split(U, 3, axis=1)
+
+            # Bias in TF2 has shape [2*3*units], split and then sum input+recurrent
+            b_input, b_recurrent = tf.unstack(b, axis=0)  # each is [3*units]
+
+            # Split into gates
+            b_z_i, b_r_i, b_h_i = tf.split(b_input, 3, axis=0)
+            b_z_r, b_r_r, b_h_r = tf.split(b_recurrent, 3, axis=0)
+
+            # Combine input + recurrent for each gate
+            b_z = b_z_i + b_z_r
+            b_r = b_r_i + b_r_r
+            b_h = b_h_i + b_h_r
+
+            # === Condition focuses on forget/update gate ===
+            # ||U_r||_∞
+            U_r_norm = tf.reduce_max(tf.reduce_sum(tf.abs(U_r), axis=1))
+
+            # σ(||[W_f, U_f, b_f]||_∞), here "forget" is the reset/update gate
+            b_f_2d = tf.expand_dims(b_r, axis=1)  # pick r-gate (can adapt if using z instead)
+            M_f = tf.concat([W_r, U_r, b_f_2d], axis=1)
+            row_sums_f = tf.reduce_sum(tf.abs(M_f), axis=1)
+            norm_inf_f = tf.reduce_max(row_sums_f)
+            sigma_f = tf.sigmoid(norm_inf_f)
+
+            lhs = U_r_norm * sigma_f
+
+            if lhs >= 1.0:
+                scale = 0.9 / lhs  # shrink factor
+
+                # Split into gates
+                U_z, U_r, U_h = tf.split(U, 3, axis=1)
+
+                # Row sums for U_r
+                row_sums = tf.reduce_sum(tf.abs(U_r), axis=1, keepdims=True)  # [units, 1]
+
+                # Condition: row_sums * sigma_f < 1
+                thresh = 1.0 / sigma_f
+                mask = row_sums >= thresh   # rows that violate condition
+
+                # Row-wise scaling: only shrink violating rows
+                scaling_factors = tf.where(mask, scale * tf.ones_like(row_sums), tf.ones_like(row_sums))
+
+                U_r_projected = U_r * scaling_factors
+
+                # Recombine and assign
+                U_new = tf.concat([U_z, U_r_projected, U_h], axis=1)
+                U.assign(U_new)
+
+                print(f"[ISS] GRU: projected {tf.reduce_sum(tf.cast(mask, tf.int32)).numpy()} violating rows.")
+
+        elif cell_type == "lstm":
+            # Grab the LSTMCell
+            lstm_cell = self._cell.KGCELL   # or QCELL if enforcing on Q-network
+
+            # Extract weight matrices
+            # In tf.keras, LSTMCell packs all gates [i, f, c, o] together in kernel and recurrent_kernel
+            for w in lstm_cell.trainable_weights:
+                if "recurrent_kernel" in w.name:
+                    U = w  # shape [units, 4*units]
+                if "kernel" in w.name:
+                    W = w  # shape [input_dim, 4*units]
+                if "bias" in w.name:
+                    b = w
+
+            units = lstm_cell.units
+
+            # Split into gate matrices
+            # Ordering in TF is: [i, f, c, o]
+            U_i, U_f, U_c, U_o = tf.split(U, num_or_size_splits=4, axis=1)
+            W_i, W_f, W_c, W_o = tf.split(W, num_or_size_splits=4, axis=1)
+            b_i, b_f, b_c, b_o = tf.split(b, num_or_size_splits=4, axis=0)
+
+            # Compute induced ∞-norms
+            def compute_bar_sigma(W, U, b):
+                b_2d = tf.expand_dims(b, axis=1)  # [H, 1]
+                M = tf.concat([W, U, b_2d], axis=1)  # [H, d_in+H+1]
+                row_sums = tf.reduce_sum(tf.abs(M), axis=1)   # ℓ₁ per row
+                norm_inf = tf.reduce_max(row_sums)            # induced ∞-norm
+                return 1 / (1 + np.exp(-norm_inf))
+
+            sigma = lambda x: 1 / (1 + np.exp(-x))  # logistic
+
+            sigma_f = sigma(compute_bar_sigma(W_f, U_f, b_f))
+            sigma_i = sigma(compute_bar_sigma(W_i, U_i, b_i))
+            sigma_o = sigma(compute_bar_sigma(W_o, U_o, b_o))
+            U_c_norm = tf.norm(U_c, ord=np.inf).numpy()
+
+            cond1 = (1 + sigma_o) * sigma_f
+            cond2 = (1 + sigma_o) * sigma_i * U_c_norm
+
+            if cond1 >= 1.0 or cond2 >= 1.0:
+                scale = 0.9 / max(cond1, cond2)  # shrink to stay within bounds
+                new_U = U * scale
+                U.assign(new_U)
+                print(f"[ISS] Scaled LSTM recurrent weights by {scale:.3f} to satisfy ISS condition.")
+    
     def training(self, model, Train_Obs, Train_Target, Valid_Obs, Valid_Target,
                  test_obs, test_targets, epochs, batch_size, 
                  x_epoch, record, fig, ax0, draw_fig):
@@ -334,21 +463,21 @@ class PiSSM(k.models.Model):
                     train_loss_epoch =[]
                     for i in range(len(Ybatch)):
                         NetIn = Ubatch[i]
+                        reinforce_loss = 0
                         with tf.GradientTape() as tape:
                             preds, logp_list = model(NetIn)
                             reinforce_loss = self.reinforce_loss(Ybatch[i], preds, logp_list)
 
+                        with tf.GradientTape() as tape2:
+                            preds, _ = model(NetIn)  # recompute
+                            phi_loss = self.gaussian_nll(Ybatch[i], preds)
+                        
                         print('epoch: %d  reinforce_loss: %s' % (epoch, reinforce_loss.numpy()))
                         if np.isnan(reinforce_loss.numpy()):
                             break
                         dynamic_variables = model._layer_rkn.cell._coefficient_net.weights
-                        # dynamic_variables = model._layer_rkn.cell._coefficient_net.trainable_variables
                         gradients = tape.gradient(reinforce_loss, dynamic_variables)
                         tf.keras.optimizers.Adam(learning_rate = self.lr, clipnorm=5.0).apply_gradients(zip(gradients, dynamic_variables))
-
-                        with tf.GradientTape() as tape2:
-                            preds, _ = model(NetIn)  # recompute
-                            phi_loss = self.gaussian_nll(Ybatch[i], preds)
                         
                         print('epoch: %d  base_loss: %s' % (epoch, phi_loss.numpy()))
                         if np.isnan(phi_loss.numpy()):
@@ -372,21 +501,26 @@ class PiSSM(k.models.Model):
                             break
                         train_loss_epoch.append(loss)
                         Training_Loss.append(loss)  
+                        # === Enforce ISS stability constraint ===
+                        if self.cell_type.lower() == 'gin':
+                            model.enforce_iss_condition(cell_type=model._layer_rkn.cell.cell_type)
 
                     average_train_loss = np.mean(np.array(train_loss_epoch))
+
                     
-                    if (average_train_loss < min_train_loss):
-                        min_train_loss = average_train_loss
-                        trl.write("*********************************min_train_loss:{} \n".format(min_train_loss))
-                    average_test_loss = np.mean(np.array(self.testing(model, test_obs, test_targets, batch_size)))
-                    if (average_test_loss < min_test_loss):
-                        min_test_loss = average_test_loss
-                        tel.write("*********************************min_train_loss:{} \n".format(min_test_loss))
-                    tel.write("epoch: {}, test_loss:{} \n".format(epoch, average_test_loss))
-                    trl.write("epoch: {}, train_loss:{} \n".format(epoch, average_train_loss))
-                    if np.isnan(average_train_loss):
-                        break
-                    self.draw_curve(epoch, average_train_loss, average_test_loss, record, fig, ax0, x_epoch, batch_size, batch_size)
+                    
+                    # if (average_train_loss < min_train_loss):
+                    #     min_train_loss = average_train_loss
+                    #     trl.write("*********************************min_train_loss:{} \n".format(min_train_loss))
+                    # average_test_loss = np.mean(np.array(self.testing(model, test_obs, test_targets, batch_size)))
+                    # if (average_test_loss < min_test_loss):
+                    #     min_test_loss = average_test_loss
+                    #     tel.write("*********************************min_train_loss:{} \n".format(min_test_loss))
+                    # tel.write("epoch: {}, test_loss:{} \n".format(epoch, average_test_loss))
+                    # trl.write("epoch: {}, train_loss:{} \n".format(epoch, average_train_loss))
+                    # if np.isnan(average_train_loss):
+                    #     break
+                    # self.draw_curve(epoch, average_train_loss, average_test_loss, record, fig, ax0, x_epoch, batch_size, batch_size)
 
                     if ((epoch+1) % self.lr_decay_it == 0):
                         self.lr *= self.lr_decay

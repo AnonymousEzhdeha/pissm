@@ -106,7 +106,8 @@ class PiSSMTransitionCell(k.layers.Layer):
                  Xgru_InputSize = 15,
                  Fgru_InputSize = 15,
                  trans_net_hidden_units=[],
-                 never_invalid=False):
+                 never_invalid=False,
+                 cell_type="gru"):
 
         """
         latent_state_dim: dimension of the latent state 
@@ -146,7 +147,14 @@ class PiSSMTransitionCell(k.layers.Layer):
         self.KG_InputSize = KG_InputSize
         self.Xgru_InputSize = Xgru_InputSize
         self.Fgru_InputSize = Fgru_InputSize
-        
+        self.cell_type = cell_type.lower().strip()
+
+        if self.cell_type not in ["gru", "lstm"]:
+            raise ValueError(
+                f"Unsupported cell_type '{cell_type}'. "
+                "Only 'gru' and 'lstm' are supported in PiSSMTransitionCell."
+            )
+                
         
     def build(self, input_shape):
         
@@ -195,56 +203,85 @@ class PiSSMTransitionCell(k.layers.Layer):
         if self.Qnetwork == "Fgru":
             #build Q gru parameters
             self.GRUQunit = self.Fgru_Units
-            # self.CholeskyKG = self.add_weight(shape=[ self._lsd * self._lod , self._lod * self._lod], name="grulastweight", initializer='random_normal') #(KG, lod^2)
             self.NextWeightGRUQ = self.add_weight(shape=[self.GRUQunit , self._lsd], name="grunextweight", initializer='random_normal') #(gru out, Q)
             self.PrevWeightGRUQ = self.add_weight(shape=[  self._lsd**2 , self.Fgru_InputSize ], name="gruprevweight", initializer='random_normal')# (2*lsd, gru in)
-            self.GRUQ = k.layers.GRUCell( self.GRUQunit)
-            self.GRUQ_state = self.init_Q_matrices * tf.ones([input_shape[0],  self.GRUQunit ])
+            # self.GRUQ = k.layers.GRUCell( self.GRUQunit)
+            if self.cell_type == "gru":
+                self.QCELL = k.layers.GRUCell(self.GRUQunit)
+            elif self.cell_type == "lstm":
+                self.QCELL = k.layers.LSTMCell(self.GRUQunit)
+            # self.Q_state = self.init_Q_matrices * tf.ones([input_shape[0],  self.GRUQunit ])
+            if self.cell_type == "gru":
+                self.Q_state = self.init_Q_matrices * tf.ones([input_shape[0], self.GRUQunit])
+            elif self.cell_type == "lstm":
+                h0 = self.init_Q_matrices * tf.ones([input_shape[0], self.GRUQunit])
+                c0 = self.init_Q_matrices * tf.ones([input_shape[0], self.GRUQunit])
+                self.Q_state = [h0, c0]
             
         if self.Qnetwork == "Xgru":
             #build Q gru parameters
             self.GRUQunit = self.Xgru_Units
-            # self.CholeskyKG = self.add_weight(shape=[ self._lsd * self._lod , self._lod * self._lod], name="grulastweight", initializer='random_normal') #(KG, lod^2)
             self.NextWeightGRUQ = self.add_weight(shape=[self.GRUQunit , self._lsd], name="grunextweight", initializer='random_normal') #(gru out, Q)
             self.PrevWeightGRUQ = self.add_weight(shape=[  self._lsd , self.Xgru_InputSize ], name="gruprevweight", initializer='random_normal')# (2*lsd, gru in)
-            self.GRUQ = k.layers.GRUCell( self.GRUQunit)
-            self.GRUQ_state = self.init_Q_matrices * tf.ones([input_shape[0],  self.GRUQunit ])
+            # self.QCELL = k.layers.GRUCell( self.GRUQunit)
+            if self.cell_type == "gru":
+                self.QCELL = k.layers.GRUCell(self.GRUQunit)
+            elif self.cell_type == "lstm":
+                self.QCELL = k.layers.LSTMCell(self.GRUQunit)
+            # self.Q_state = self.init_Q_matrices * tf.ones([input_shape[0],  self.GRUQunit ])
+            if self.cell_type == "gru":
+                self.Q_state = self.init_Q_matrices * tf.ones([input_shape[0], self.GRUQunit])
+            elif self.cell_type == "lstm":
+                h0 = self.init_Q_matrices * tf.ones([input_shape[0], self.GRUQunit])
+                c0 = self.init_Q_matrices * tf.ones([input_shape[0], self.GRUQunit])
+                self.Q_state = [h0, c0]
             
         
+        #####
+        # Kalman Gain RNN cell setup
+        self.GRUKGunit = self.KG_Units
+
+        # Input projection: [lsd^2 + lod] → KG_InputSize
+        self.PrevWeightKG = self.add_weight(
+            shape=[self._lsd**2 + self._lod, self.KG_InputSize],
+            name="kg_prevweight",
+            initializer='random_normal'
+        )
+
+        # Output projection(s) after RNN
+        if self.USE_MLP_AFTER_KGGRU:
+            self.LastWeightKG = self.add_weight(
+                shape=[4 * self._lsd * self._lod, self._lsd * self._lod],
+                name="kg_lastweight",
+                initializer='random_normal'
+            )
+            self.NextWeightKG = self.add_weight(
+                shape=[self.GRUKGunit, 4 * self._lsd * self._lod],
+                name="kg_nextweight",
+                initializer='random_normal'
+            )
+        else:
+            self.LastWeightKG = self.add_weight(
+                shape=[self.GRUKGunit, self._lsd * self._lod],
+                name="kg_lastweight",
+                initializer='random_normal'
+            )
         
-        if self.USE_CONV == True:
-            #build KG gru parameters
-            if self.USE_MLP_AFTER_KGGRU == True:
-                self.GRUKGunit = self.KG_Units 
-                self.LastWeightKG = self.add_weight(shape=[4 * self._lsd * self._lod , self._lsd * self._lod], name="grulastweight", initializer='random_normal') #(4*KG, KG)
-                self.NextWeightKG = self.add_weight(shape=[self.GRUKGunit ,4 * self._lsd * self._lod], name="grunextweight", initializer='random_normal') #(gru out, KG*4)
-                self.PrevWeightKG = self.add_weight(shape=[self._lsd**2 + self._lod, self.KG_InputSize], name="gruprevweight", initializer='random_normal')# (lod + lsd^2, gru in)
-                self.GRUKG = k.layers.GRUCell( self.GRUKGunit)
-                self.GRUKG_state = self.init_KF_matrices * tf.ones([input_shape[0],  self.GRUKGunit ])
-            else:
-                self.GRUKGunit = self.KG_Units 
-                self.LastWeightKG = self.add_weight(shape=[self.GRUKGunit, self._lsd * self._lod], name="grulastweight", initializer='random_normal') #(gru out, KG)
-                self.PrevWeightKG = self.add_weight(shape=[self._lsd**2 + self._lod, self.KG_InputSize], name="gruprevweight", initializer='random_normal')# (lod + lsd^2, gru in)
-                self.GRUKG = k.layers.GRUCell( self.GRUKGunit)
-                self.GRUKG_state = self.init_KF_matrices * tf.ones([input_shape[0],  self.GRUKGunit ])
-        if self.USE_CONV == False:
-            #build KG gru parameters
-            if self.USE_MLP_AFTER_KGGRU == True:
-                self.GRUKGunit = self.KG_Units 
-                self.LastWeightKG = self.add_weight(shape=[4 * self._lsd * self._lod , self._lsd * self._lod], name="grulastweight", initializer='random_normal') #(4*KG, KG)
-                self.NextWeightKG = self.add_weight(shape=[self.GRUKGunit ,4 * self._lsd * self._lod], name="grunextweight", initializer='random_normal') #(gru out, KG*4)
-                self.PrevWeightKG = self.add_weight(shape=[self._lsd**2 + self._lod, self.KG_InputSize], name="gruprevweight", initializer='random_normal')# (lod + lsd^2, gru in)
-                self.GRUKG = k.layers.GRUCell( self.GRUKGunit)
-                self.GRUKG_state = self.init_KF_matrices * tf.ones([input_shape[0],  self.GRUKGunit ])
-            else:
-                self.GRUKGunit = self.KG_Units 
-                self.LastWeightKG = self.add_weight(shape=[self.GRUKGunit, self._lsd * self._lod], name="grulastweight", initializer='random_normal') #(gru out, KG)
-                self.PrevWeightKG = self.add_weight(shape=[self._lsd**2 + self._lod, self.KG_InputSize], name="gruprevweight", initializer='random_normal')# (lod + lsd^2, gru in)
-                self.GRUKG = k.layers.GRUCell( self.GRUKGunit)
-                self.GRUKG_state = self.init_KF_matrices * tf.ones([input_shape[0],  self.GRUKGunit ])
+        # Choose RNN cell type
+        if self.cell_type == "gru":
+            self.KGCELL = k.layers.GRUCell(self.GRUKGunit)
+            self.KG_state = self.init_KF_matrices * tf.ones([input_shape[0], self.GRUKGunit])
+        elif self.cell_type == "lstm":
+            self.KGCELL = k.layers.LSTMCell(self.GRUKGunit)
+            h0 = self.init_KF_matrices * tf.ones([input_shape[0], self.GRUKGunit])
+            c0 = self.init_KF_matrices * tf.ones([input_shape[0], self.GRUKGunit])
+            self.KG_state = [h0, c0]
         
-        #build dense layer for diag covariance
-        self._layer_covar_gru = k.layers.Dense(self._lsd, activation=lambda x: k.activations.elu(x) + 1)
+        # Dense layer for diag covariance (still shared)
+        self._layer_covar_rnn = k.layers.Dense(
+            self._lsd,
+            activation=lambda x: k.activations.elu(x) + 1
+        )
         
         super().build(input_shape)
 
@@ -362,8 +399,8 @@ class PiSSMTransitionCell(k.layers.Layer):
     def _predict_q_Fgru(self, transition_matrix): # F_t is used
         stacked_states = tf.reshape(transition_matrix, [transition_matrix.shape[0], -1])
         in_GRU = tf.matmul(stacked_states, self.PrevWeightGRUQ)
-        Q, _ = self.GRUQ(in_GRU, self.GRUQ_state)
-        self.GRUQ_state = Q # next self.GRUQ_state
+        Q, _ = self.QCELL(in_GRU, self.Q_state)
+        self.Q_state = Q # next self.Q_state
         Q = tf.matmul(Q, self.NextWeightGRUQ)
         Q = elup1(Q)
         return Q
@@ -371,45 +408,58 @@ class PiSSMTransitionCell(k.layers.Layer):
     def _predict_q_Xgru(self, state_mean): # state_mean = mu_t-1|t-1
         # stacked_states = tf.concat([state_mean, prior_mean], axis=-1)
         in_GRU = tf.matmul(state_mean, self.PrevWeightGRUQ)
-        Q, _ = self.GRUQ(in_GRU, self.GRUQ_state)
-        self.GRUQ_state = Q # next self.GRUQ_state
+        Q, _ = self.QCELL(in_GRU, self.Q_state)
+        self.Q_state = Q # next self.Q_state
         Q = tf.matmul(Q, self.NextWeightGRUQ)
         Q = elup1(Q)
         return Q
     
-    def _predict_kg_gru(self, prior_covar, obs_covar):
+    def _predict_kg_cell(self, prior_covar, obs_covar):
         
         if self.USE_CONV == True:
             #propagate covar matrix through the conv2d
             prior_covar_matrix = tf.reshape(prior_covar, [prior_covar.shape[0], self._lsd, self._lsd])
             prior_covar_matrix = tf.expand_dims(prior_covar_matrix, -1)
-            prior_covar = self._prop_to_layers(prior_covar_matrix, self.build_conv_gru())
+            prior_covar = self._prop_to_layers(prior_covar_matrix, self.build_conv_cell())
             
         #
+        # stacked_covars = tf.concat([prior_covar, obs_covar], axis=-1)
+        # in_GRU = tf.matmul(stacked_covars, self.PrevWeightKG)
+        # KG, _ = self.KGCELL(in_GRU, self.KG_state)
+        # self.KG_state = KG # next self.KG_state
+        # if self.USE_MLP_AFTER_KGGRU == True:
+        #     KG = tf.matmul(KG, self.NextWeightKG)
+        #     KG = tf.matmul(KG, self.LastWeightKG)
+        # else:
+        #     KG = tf.matmul(KG, self.LastWeightKG)
+        # KG = tf.reshape(KG, [KG.shape[0], self._lsd, self._lod])
+
         stacked_covars = tf.concat([prior_covar, obs_covar], axis=-1)
-        in_GRU = tf.matmul(stacked_covars, self.PrevWeightKG)
-        KG, _ = self.GRUKG(in_GRU, self.GRUKG_state)
-        self.GRUKG_state = KG # next self.GRUKG_state
-        if self.USE_MLP_AFTER_KGGRU == True:
+        in_RNN = tf.matmul(stacked_covars, self.PrevWeightKG)
+
+        if self.cell_type == "gru":
+            # GRU: output == new hidden state
+            KG, _ = self.KGCELL(in_RNN, self.KG_state)
+            self.KG_state = KG  # update state with hidden
+
+        elif self.cell_type == "lstm":
+            # LSTM: output = h_new, state = [h_new, c_new]
+            KG, [h_new, c_new] = self.KGCELL(in_RNN, self.KG_state)
+            self.KG_state = [h_new, c_new]  # update with both states
+            # use h_new as the Kalman gain representation
+            # KG = h_new
+
+        if self.USE_MLP_AFTER_KGGRU:
             KG = tf.matmul(KG, self.NextWeightKG)
             KG = tf.matmul(KG, self.LastWeightKG)
         else:
             KG = tf.matmul(KG, self.LastWeightKG)
-        KG = tf.reshape(KG, [KG.shape[0], self._lsd, self._lod])
 
-        # KG = tf.matmul(KG, self.NextWeightKG)
-        # KG = tf.matmul(KG, self.LastWeightKG)
-        # KG = tf.matmul(KG, self.CholeskyKG)
-        # KG = tf.reshape(KG, [KG.shape[0], self._lod, self._lod])
-        # Diag_KG = tf.linalg.diag_part(KG)
-        # Diag_elements_dense = self._layer_covar_gru(Diag_KG)
-        # elup_Diag_elements = tf.linalg.diag(elup1(Diag_elements_dense))
-        # Positive_KG = elup_Diag_elements + ( KG - tf.linalg.diag(tf.linalg.diag_part(KG)))
-        # KG = tf.matmul(tf.matmul(prior_covar, tf.transpose(self.H_matrix)), tf.matmul(Positive_KG, tf.transpose(Positive_KG)))
+        KG = tf.reshape(KG, [KG.shape[0], self._lsd, self._lod])
 
         return KG
     
-    def build_conv_gru(self):
+    def build_conv_cell(self):
         return [
             # 1: Conv Layer
             k.layers.Conv2D(4, kernel_size=5, padding="same", name="first conv2d gru"),
@@ -446,7 +496,7 @@ class PiSSMTransitionCell(k.layers.Layer):
         #(mu_t|t-1, sigma_t|t-1, obs_mu_t, obs_covar_t)
         
         
-        KG = self._predict_kg_gru( prior_covar, obs_covar)
+        KG = self._predict_kg_cell( prior_covar, obs_covar)
         
         # posterior mean
         expanded_prior_mean_mean = tf.expand_dims(prior_mean, -1)
@@ -460,7 +510,7 @@ class PiSSMTransitionCell(k.layers.Layer):
         posterior_covar_matrix = prior_covar_matrix - tf.matmul(tf.matmul(KG,S), tf.transpose(KG, perm=[0, 2, 1]))
         #
         Diag_elements = tf.linalg.diag_part(posterior_covar_matrix)
-        Diag_elements_dense = self._layer_covar_gru(Diag_elements)
+        Diag_elements_dense = self._layer_covar_rnn(Diag_elements)
         elup_Diag_elements = tf.linalg.diag(elup1(Diag_elements_dense))
         posterior_covar_matrix = elup_Diag_elements + ( posterior_covar_matrix - tf.linalg.diag(tf.linalg.diag_part(posterior_covar_matrix)))
         #
