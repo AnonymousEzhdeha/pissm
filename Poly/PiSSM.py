@@ -335,10 +335,10 @@ class PiSSM(k.models.Model):
             b_h = b_h_i + b_h_r
 
             # === Condition focuses on forget/update gate ===
-            # ||U_r||_∞
+            # ||U_r||_inf
             U_r_norm = tf.reduce_max(tf.reduce_sum(tf.abs(U_r), axis=1))
 
-            # σ(||[W_f, U_f, b_f]||_∞), here "forget" is the reset/update gate
+            # sigma(||[W_f, U_f, b_f]||_inf), here "forget" is the reset/update gate
             b_f_2d = tf.expand_dims(b_r, axis=1)  # pick r-gate (can adapt if using z instead)
             M_f = tf.concat([W_r, U_r, b_f_2d], axis=1)
             row_sums_f = tf.reduce_sum(tf.abs(M_f), axis=1)
@@ -393,12 +393,12 @@ class PiSSM(k.models.Model):
             W_i, W_f, W_c, W_o = tf.split(W, num_or_size_splits=4, axis=1)
             b_i, b_f, b_c, b_o = tf.split(b, num_or_size_splits=4, axis=0)
 
-            # Compute induced ∞-norms
+            # Compute induced inf-norms
             def compute_bar_sigma(W, U, b):
                 b_2d = tf.expand_dims(b, axis=1)  # [H, 1]
                 M = tf.concat([W, U, b_2d], axis=1)  # [H, d_in+H+1]
-                row_sums = tf.reduce_sum(tf.abs(M), axis=1)   # ℓ₁ per row
-                norm_inf = tf.reduce_max(row_sums)            # induced ∞-norm
+                row_sums = tf.reduce_sum(tf.abs(M), axis=1)   # l₁ per row
+                norm_inf = tf.reduce_max(row_sums)            # induced inf-norm
                 return 1 / (1 + np.exp(-norm_inf))
 
             sigma = lambda x: 1 / (1 + np.exp(-x))  # logistic
